@@ -85,18 +85,21 @@ const bool ROLE_PASIF = LOW;   // Pin LOW  → transistör kesim  → fan DURUR
 // ===========================================================================
 
 // Motor hızları (0-255 PWM aralığı)
-#define HIZ_ILERI       210   // Otonom moddaki ileri hız
-#define HIZ_GERI        220   // Otonom moddaki geri kaçış hızı
-#define HIZ_DONUS       220   // Otonom moddaki dönüş hızı
+// HIZ_ILERI bilerek düşük: HC-SR04 yumuşak/eğik yüzeyleri kötü gördüğü için
+// yavaş hız reaksiyon süresini artırır, çarpışma şansını azaltır.
+#define HIZ_ILERI       150   // Otonom moddaki ileri hız (yavaş = güvenli)
+#define HIZ_GERI        150   // Otonom moddaki geri kaçış hızı
+#define HIZ_DONUS       150   // Otonom moddaki dönüş hızı
 
 // Engel algılama parametreleri
-#define ENGEL_ESIK_CM   15    // Bu mesafenin altındaki cisimler engel sayılır
+#define ENGEL_ESIK_CM   30    // Bu mesafenin altındaki cisimler engel sayılır (erken kaç)
 #define MESAFE_GECERSIZ 999   // HC-SR04 timeout veya hatalı okuma değeri
 
 // Otonom modda engelden kaçış adımlarının süreleri (ms)
 #define SURE_DUR        150   // Engel görünce durup teyit etme süresi
 #define SURE_GERI       200   // Engelden uzaklaşmak için geri gitme süresi
 #define SURE_DONUS      150   // Yeni yön bulmak için dönüş süresi
+#define SURE_KOR_ILERI  150   // Dönüş sonrası kısa süre kör ileri (kaçış-kaçış döngüsünü kırar)
 
 // Manuel modda her tuşa basışta yapılacak küçük "dürtme" süreleri
 // (Uygulama tek karakter gönderdiği için robot bu süre boyunca hareket eder)
@@ -104,7 +107,7 @@ const bool ROLE_PASIF = LOW;   // Pin LOW  → transistör kesim  → fan DURUR
 #define DURTME_DONUS    80    // Sağ/sol tek tuş süresi (daha kısa = daha az açı)
 
 // Telefona telemetri gönderim periyodu (ms)
-#define SENSOR_PERIYOT  1000
+#define SENSOR_PERIYOT  100
 
 // ===========================================================================
 // BLE — Nordic UART Service UUID'leri (standart NUS profili)
@@ -128,7 +131,9 @@ unsigned long sonKomutZamani     = 0;  // En son manuel komut anı
 unsigned long aktifDurtmeSuresi  = 0;  // Mevcut dürtmenin süresi (ileri/dönüş'e göre değişir)
 
 // Otonom mod state machine — engelden kaçış adımları sırayla yürür
-enum OtonomState { OTO_ILERI, OTO_DUR, OTO_GERI, OTO_DONUS };
+// OTO_KOR_ILERI: dönüş sonrası kısa süre engele bakmadan ileri gitme aşaması
+// (aynı engelden tekrar tekrar kaçma döngüsünü kırmak için)
+enum OtonomState { OTO_ILERI, OTO_DUR, OTO_GERI, OTO_DONUS, OTO_KOR_ILERI };
 OtonomState otonomState = OTO_ILERI;
 unsigned long otonomStateBaslangic = 0;  // Mevcut state'e girilen an
 bool donusSaga = true;                   // Her engelde rastgele yön seçilir
@@ -207,13 +212,32 @@ long mesafeOku() {
 
 // 3 ardışık okumanın medyanını döndürür — tek parazitli/sıçramış okumayı eler.
 // Otonom modda yanlış engel algılamasını azaltmak için kullanılır.
+//
+// TIMEOUT MANTIĞI:
+//   - 3/3 timeout → büyük ihtimalle açık alan (>4m boşluk), "engel yok" döndür
+//   - 1-2 timeout → geçerli okumalardan en küçüğünü al (en yakın cisim önemli)
+//   - 0 timeout   → klasik medyan
+// Bu sayede açık alanda gereksiz manevra olmaz; ama yakında kararsız sinyal
+// veren yumuşak/eğik yüzeyler hala yakalanır (en az bir okuma kısa gelir).
 long mesafeOkuFiltreli() {
   long a = mesafeOku();
   long b = mesafeOku();
   long c = mesafeOku();
-  if ((a <= b && b <= c) || (c <= b && b <= a)) return b;
-  if ((b <= a && a <= c) || (c <= a && a <= b)) return a;
-  return c;
+
+  int timeoutSayisi = (a == MESAFE_GECERSIZ) + (b == MESAFE_GECERSIZ) + (c == MESAFE_GECERSIZ);
+
+  // Tüm okumalar timeout → açık alan, "engel yok"
+  if (timeoutSayisi == 3) {
+    return MESAFE_GECERSIZ;
+  }
+
+  // En az bir geçerli okuma var → timeoutları at, geçerlilerden en küçüğünü dön
+  // (En yakın cisim en kritik bilgi, "kötümser" davranıyoruz)
+  long enYakin = MESAFE_GECERSIZ;
+  if (a != MESAFE_GECERSIZ && a < enYakin) enYakin = a;
+  if (b != MESAFE_GECERSIZ && b < enYakin) enYakin = b;
+  if (c != MESAFE_GECERSIZ && c < enYakin) enYakin = c;
+  return enYakin;
 }
 
 // ===========================================================================
@@ -235,9 +259,10 @@ class MyCallbacks: public BLECharacteristicCallbacks {
         fanAyarla(true);
         break;
 
-      case 'S':  // Acil durdurma — otonomu da kapatır, motorları durdurur
+      case 'S':  // Acil durdurma — otonomu kapatır, motorları durdurur, fanı kapatır
         otonomMod = false;
         motorDur();
+        fanAyarla(false);  // X ile açılan fan, S ile birlikte otomatik kapansın
         break;
 
       case 'V':  // Fan toggle (aç/kapa)
@@ -286,8 +311,13 @@ void setup() {
   // Rastgele dönüş yönü için iyi bir seed: boş analog pin + ESP32 donanım RNG
   randomSeed(analogRead(35) ^ esp_random());
 
-  // Fan kontrol pini: TIP3055 aktif-HIGH olduğu için boot anında LOW kalsın
-  // (transistör kesim, fan kapalı).
+  // Fan kontrol pini: TIP3055 aktif-HIGH olduğu için boot anında LOW kalsın.
+  // INPUT_PULLDOWN ile pini önce yere çek, sonra OUTPUT LOW yaz — bu sayede
+  // boot süresince transistör base'i floating kalmaz ve fan kendiliğinden
+  // tetiklenmez.
+  pinMode(roleFan, INPUT_PULLDOWN);
+  delayMicroseconds(100);
+  digitalWrite(roleFan, ROLE_PASIF);
   pinMode(roleFan, OUTPUT);
   digitalWrite(roleFan, ROLE_PASIF);
   fanAcik = false;
@@ -318,14 +348,16 @@ void setup() {
 // OTONOM MOD STATE MACHINE
 // ===========================================================================
 //
-// Engelden kaçış 4 aşamalı bir state makinesiyle yürütülür. delay() kullanılmaz;
+// Engelden kaçış 5 aşamalı bir state makinesiyle yürütülür. delay() kullanılmaz;
 // her aşama millis() ile süre kontrol eder. Bu sayede otonom moddayken bile
 // BLE komutları (özellikle 'S' acil dur) anında işlenebilir.
 //
-//   OTO_ILERI  → düz ilerle, mesafe sensörü ile sürekli engel kontrolü
-//   OTO_DUR    → engel görüldü, dur, kısa süre sonra teyit oku (false alarm filtresi)
-//   OTO_GERI   → teyit edildi, geri git
-//   OTO_DONUS  → rastgele seçilen yöne dön, sonra OTO_ILERI'ye geri dön
+//   OTO_ILERI      → düz ilerle, mesafe sensörü ile sürekli engel kontrolü
+//   OTO_DUR        → engel görüldü, dur, kısa süre sonra teyit oku (false alarm filtresi)
+//   OTO_GERI       → teyit edildi, geri git
+//   OTO_DONUS      → rastgele seçilen yöne dön
+//   OTO_KOR_ILERI  → dönüş sonrası kısa süre engel kontrolü yapmadan ileri git
+//                    (kaçış-kaçış döngüsünü kırmak için), sonra OTO_ILERI'ye dön
 // ===========================================================================
 void otonomCalistir() {
   unsigned long simdi = millis();
@@ -376,7 +408,19 @@ void otonomCalistir() {
 
     case OTO_DONUS: {
       if (gecen >= SURE_DONUS) {
-        // Dönüş tamamlandı → tekrar ileri sürüşe geç
+        // Dönüş tamamlandı → kısa süre kör ileri git
+        // (sensör hala aynı engele bakıyor olabilir, hemen tekrar kaçmasın)
+        motorSur(HIZ_ILERI, true, true);
+        otonomState = OTO_KOR_ILERI;
+        otonomStateBaslangic = simdi;
+      }
+      break;
+    }
+
+    case OTO_KOR_ILERI: {
+      // Bu state'te kasten engel kontrolü YAPILMIYOR → kaçış-kaçış döngüsünü
+      // kırar. Yeni yöne biraz mesafe aldıktan sonra normal sürüşe dön.
+      if (gecen >= SURE_KOR_ILERI) {
         otonomState = OTO_ILERI;
       }
       break;
